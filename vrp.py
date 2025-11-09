@@ -83,7 +83,7 @@ if "distance_df" not in st.session_state or st.session_state.get("dm_n", None) !
     st.session_state["distance_df"] = default_matrix(num_locations)
     st.session_state["dm_n"] = num_locations
 
-distance_df = st.experimental_data_editor(st.session_state["distance_df"], num_rows="fixed", key="dist_editor")
+distance_df = st.data_editor(st.session_state["distance_df"], num_rows="fixed", key="dist_editor")
 try:
     dist_mat = distance_df.astype(int).values
 except Exception as e:
@@ -104,7 +104,7 @@ if "weights" not in st.session_state or st.session_state.get("w_n", None) != num
     st.session_state["weights"] = default_weights(num_locations)
     st.session_state["w_n"] = num_locations
 
-weights_df = st.experimental_data_editor(
+weights_df = st.data_editor(
     pd.DataFrame({"Weight": st.session_state["weights"]}), num_rows="fixed", key="weights_editor"
 )
 try:
