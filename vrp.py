@@ -1,5 +1,5 @@
 """
-Final VRP Streamlit app (presentation-ready)
+Final VRP Streamlit app 
 
 Features:
 - No Excel: user inputs everything on the frontend
@@ -11,7 +11,7 @@ Features:
     - Solution summary table and key metrics
     - Embedded route map image
 - Team: Vaishali Anand, Vipul Yadav, Kundan, Arpit Agrawal
-- Course: MSL304 (you can edit header text below if needed)
+- Course: MSL304 
 """
 
 import io
@@ -38,7 +38,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 # App config & Header
 # ----------------------------
 st.set_page_config(page_title="VRP Solver — Final (PDF + Polished Viz)", layout="wide")
-st.title("🚛 Vehicle Routing Problem — Interactive Solver (Final)")
+st.title("Vehicle Routing Problem — Interactive Solver")
 st.markdown(
     "Team: **Vaishali Anand, Vipul Yadav, Kundan, Arpit Agrawal**  \nCourse: **MSL304**"
 )
@@ -426,7 +426,7 @@ if st.button("🔎 Solve VRP"):
         return buf
 
     pdf_buf = build_pdf_bytes()
-    st.download_button("📥 Download PDF Report (with embedded route map)", data=pdf_buf.getvalue(), file_name="VRP_Report.pdf", mime="application/pdf")
+    st.download_button(" Download PDF Report (with embedded route map)", data=pdf_buf.getvalue(), file_name="VRP_Report.pdf", mime="application/pdf")
 
 st.markdown("---")
-st.caption("Polished VRP app — Team: Vaishali Anand, Vipul Yadav, Kundan, Arpit Agrawal | MSL304")
+st.caption(" VRP app — Team: Vaishali Anand, Vipul Yadav, Kundan, Arpit Agrawal | MSL304")
