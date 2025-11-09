@@ -244,6 +244,11 @@ coords = nodes[['x', 'y']].to_numpy()
 demands = nodes['demand'].astype(int).to_numpy()
 node_ids = nodes['id'].astype(int).to_list()
 
+# 🐛 FIX: Define depot_idx globally here. 
+# This ensures it is available for plotting before the clustering is run.
+depot_idx = int(np.where(np.array(node_ids) == 0)[0][0]) if 0 in node_ids else 0
+
+
 # compute distance matrix (Euclidean, rounded)
 def euclid_matrix(coords):
     n = coords.shape[0]
@@ -325,8 +330,7 @@ if do_cluster or run_pipeline:
     coords_local = st.session_state['coords']
     n_nodes = coords_local.shape[0]
     # cluster only on customers (exclude depot at index of id==0)
-    # find index of depot (id==0)
-    depot_idx = int(np.where(np.array(node_ids) == 0)[0][0]) if 0 in node_ids else 0
+    # depot_idx is now correctly defined globally before this block
     customer_mask = [i for i in range(n_nodes) if i != depot_idx]
     if cluster_method == "KMeans (default)":
         if len(customer_mask) >= num_vehicles:
@@ -373,7 +377,7 @@ else:
         "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
         "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
     ]
-    # depot
+    # depot (Uses the globally defined depot_idx)
     dpt_x, dpt_y = coords[depot_idx]
     fig_clusters.add_trace(go.Scatter(x=[dpt_x], y=[dpt_y], mode='markers+text', marker=dict(size=16, color='gold', line=dict(width=1, color='black')), text=["Depot (0)"], textposition="top center", name="Depot"))
     for v in range(num_vehicles):
@@ -404,7 +408,7 @@ if run_pipeline:
         # only perturb customer demands, not depot (index where id==0)
         demand_noise = rng_global.uniform(1 - var_d, 1 + var_d, size=varied_demands.shape)
         varied_demands = np.round(varied_demands * demand_noise).astype(int)
-        varied_demands[0] = 0  # depot demand zero
+        varied_demands[depot_idx] = 0  # depot demand zero (using global depot_idx)
 
     # For each vehicle cluster, construct local matrix and solve
     routes_info_all = []
@@ -493,7 +497,7 @@ if run_pipeline:
             # vary both demand and travel times
             vard = rng_scan.uniform(1 - var_d, 1 + var_d, size=st.session_state['demands'].shape)
             demand_s = np.round(st.session_state['demands'] * vard).astype(int)
-            demand_s[0] = 0
+            demand_s[depot_idx] = 0 # Use global depot_idx
             dist_s = apply_variation_matrix(st.session_state['dist_matrix'], var_t, rng_scan)
             # re-run clustering assignment -> routing quickly using same assignment (we perturb and reuse assignment)
             # For simplicity, we will solve per cluster like before
