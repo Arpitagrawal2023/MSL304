@@ -1,14 +1,14 @@
 """
-OptiRoute - Streamlit VRP app (Updated for Multi-objective + Time Windows + Emissions + Lateness KPI)
-Updated features:
- - Columns: id, x, y, demand, service_time, tw_start, tw_end
- - Sidebar weights: alpha (cost), beta (emission), gamma (lateness)
- - Emission & fuel cost per km
- - OR-Tools per-cluster VRP with time dimension (hard time windows + service times)
- - Weighted arc cost used by OR-Tools (alpha & beta)
- - Lateness computed post-solution and included in KPI objective score (alpha*cost + beta*emission + gamma*lateness)
+OptiRoute - Full Streamlit app
+Features:
+ - Demo / CSV upload for nodes: id,x,y,demand,service_time,tw_start,tw_end
+ - Clustering (KMeans / Greedy capacity-aware)
+ - Per-cluster OR-Tools VRP with TIME dimension (service_time + travel_time)
+ - Stochastic variation in demands and travel distances
+ - Multi-objective weighting: alpha*cost + beta*emission + gamma*lateness
+ - KPI dashboard: distance, cost, emissions, lateness, objective score, utilization
+ - Plotly maps and CSV download
 """
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -18,37 +18,50 @@ from sklearn.cluster import KMeans
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 # ---------------------------
-# Dependencies note
+# Helper solver & utilities
 # ---------------------------
-REQUIRED_PKGS = ["streamlit", "pandas", "numpy", "scikit-learn", "ortools", "plotly"]
-# install externally if missing:
-# pip3 install streamlit pandas numpy scikit-learn ortools plotly
 
-# ---------------------------
-# Utility / Solver functions
-# ---------------------------
+def euclid_matrix(coords):
+    n = coords.shape[0]
+    mat = np.zeros((n, n), dtype=int)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                mat[i, j] = 0
+            else:
+                mat[i, j] = int(round(np.linalg.norm(coords[i] - coords[j])))
+    return mat
+
+def apply_variation_matrix(base_matrix, var_pct, rng):
+    if var_pct <= 0:
+        return base_matrix.copy()
+    noise = rng.uniform(1 - var_pct, 1 + var_pct, size=base_matrix.shape)
+    varied = np.round(base_matrix * noise).astype(int)
+    varied[base_matrix == 0] = 0
+    np.fill_diagonal(varied, 0)
+    return varied
 
 def solve_vrp_ortools(dist_matrix, demands, service_times, time_windows, vehicle_capacity,
                       weighted_cost_factor=1.0, penalty=10000, time_limit=10):
     """
-    Solve a capacitated VRP with time windows (hard) for a single vehicle cluster including the depot.
-    - dist_matrix: n x n numpy int matrix (distances)
-    - demands: length n (int), index 0 is depot
-    - service_times: length n (int)
-    - time_windows: list of (start, end) tuples length n
-    - vehicle_capacity: scalar
-    - weighted_cost_factor: scalar used to multiply distances for objective (alpha*cost_per_km + beta*emission_factor)
+    Solve a (single-vehicle-per-cluster) VRP for a small cluster with TIME windows.
+    Inputs:
+      - dist_matrix: (n x n) int numpy (distance units)
+      - demands: length n (int)
+      - service_times: length n (int)
+      - time_windows: list of (start, end) ints length n
+      - vehicle_capacity: int
+      - weighted_cost_factor: scalar to multiply distances to get solver arc cost (alpha*cost+beta*em)
     Returns:
-      - routes: list of routes (each route is list of local node indices)
-      - metrics: dict {total_distance, total_load, served, arrival_times: dict(node->arrival), total_lateness}
+      - routes (list of lists, local indices)
+      - metrics dict: total_distance, total_load, served, arrival_times (local idx->time), total_lateness
     Notes:
-      - This function creates 1 vehicle (for this cluster). OR-Tools may drop nodes if infeasible (disjunction + penalty).
-      - Time windows are enforced as hard constraints (if infeasible nodes could be dropped with penalty).
+      - Index 0 assumed depot in local matrix
+      - Distances used as travel time units as default; you can scale by speed externally if needed
     """
     n = len(dist_matrix)
     if n == 0:
         return [], {"total_distance": 0, "served": 0, "total_load": 0, "arrival_times": {}, "total_lateness": 0}
-
     if n == 1:
         return [[0, 0]], {"total_distance": 0, "served": 0, "total_load": 0, "arrival_times": {}, "total_lateness": 0}
 
@@ -58,71 +71,61 @@ def solve_vrp_ortools(dist_matrix, demands, service_times, time_windows, vehicle
     manager = pywrapcp.RoutingIndexManager(n, num_vehicles, depot)
     routing = pywrapcp.RoutingModel(manager)
 
-    # Distance callback (used for objective)
-    def distance_callback(from_index, to_index):
+    # Base distance callback (used for building other callbacks)
+    def base_distance_cb(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
         return int(dist_matrix[from_node][to_node])
 
-    transit_callback_idx = routing.RegisterTransitCallback(distance_callback)
-    # Set arc cost evaluator to weighted distance (weights incorporate alpha & beta)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_idx)
+    base_dist_idx = routing.RegisterTransitCallback(base_distance_cb)
 
-    # We will scale cost inside arc cost by setting distance matrix pre-multiplied by weighted_cost_factor externally
-    # (to keep callback simple). Alternatively, one could multiply returned distances here.
+    # Weighted cost callback for solver objective (alpha*cost_per_km + beta*emission_factor rolled into a single scalar)
+    def weighted_cost_cb(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return int(round(dist_matrix[from_node][to_node] * weighted_cost_factor))
 
-    # Demand callback (for capacity dimension)
-    def demand_callback(from_index):
+    weighted_cost_idx = routing.RegisterTransitCallback(weighted_cost_cb)
+    routing.SetArcCostEvaluatorOfAllVehicles(weighted_cost_idx)
+
+    # Demand callback for capacity dimension
+    def demand_cb(from_index):
         node = manager.IndexToNode(from_index)
         return int(demands[node])
 
-    demand_callback_idx = routing.RegisterUnaryTransitCallback(demand_callback)
-    routing.AddDimensionWithVehicleCapacity(demand_callback_idx, 0, [vehicle_capacity], True, "Capacity")
+    demand_idx = routing.RegisterUnaryTransitCallback(demand_cb)
+    routing.AddDimensionWithVehicleCapacity(demand_idx, 0, [vehicle_capacity], True, "Capacity")
 
-    # Time callback: travel time + service time
-    def time_callback(from_index, to_index):
+    # Time callback = travel time (distance) + service_time at from_node
+    def time_cb(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
-        travel_time = int(dist_matrix[from_node][to_node])  # assume distance in km ~ time unit; adapt by speed if needed
-        serv = int(service_times[from_node])  # service time at from_node
+        travel_time = int(dist_matrix[from_node][to_node])
+        serv = int(service_times[from_node])
         return travel_time + serv
 
-    time_callback_idx = routing.RegisterTransitCallback(time_callback)
-    # Add time dimension (allow large slack)
-    horizon = 24 * 60 * 60  # large horizon in minutes (effectively unlimited)
+    time_idx = routing.RegisterTransitCallback(time_cb)
+    horizon = 24 * 60 * 60
     routing.AddDimension(
-        time_callback_idx,
-        1000000,  # allow waiting (slack)
+        time_idx,
+        1000000,  # allow slack/waiting
         horizon,
         False,
         "Time"
     )
-    time_dimension = routing.GetDimensionOrDie("Time")
+    time_dim = routing.GetDimensionOrDie("Time")
 
-    # Add time window constraints for each node
+    # Add time windows (hard)
     for node in range(n):
         index = manager.NodeToIndex(node)
-        start, end = int(time_windows[node][0]), int(time_windows[node][1])
-        # Set hard time window
-        time_dimension.CumulVar(index).SetRange(start, end)
+        tw_start, tw_end = int(time_windows[node][0]), int(time_windows[node][1])
+        time_dim.CumulVar(index).SetRange(tw_start, tw_end)
 
-    # Allow dropping non-depot nodes with penalty
+    # Allow dropping nodes (with penalty)
     for node in range(1, n):
         routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
 
-    # NOTE: To incorporate weighted objective alpha & beta into OR-Tools, we pre-multiply distance matrix outside
-    # or modify arc-cost evaluator. For simplicity we will multiply distances by weighted_cost_factor here:
-    # Create a wrapper transit callback that returns weighted cost (int)
-    def weighted_cost_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        base_d = dist_matrix[from_node][to_node]
-        return int(round(base_d * weighted_cost_factor))
-
-    weighted_transit_idx = routing.RegisterTransitCallback(weighted_cost_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(weighted_transit_idx)
-
-    # Search params
+    # Search parameters
     search_params = pywrapcp.DefaultRoutingSearchParameters()
     search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
@@ -133,7 +136,7 @@ def solve_vrp_ortools(dist_matrix, demands, service_times, time_windows, vehicle
     if solution is None:
         return [], {"total_distance": None, "served": 0, "total_load": 0, "arrival_times": {}, "total_lateness": None}
 
-    # Extract route, distances, loads, arrival times and lateness
+    # Extract route(s)
     routes = []
     total_distance = 0
     total_load = 0
@@ -144,18 +147,18 @@ def solve_vrp_ortools(dist_matrix, demands, service_times, time_windows, vehicle
     for v in range(num_vehicles):
         index = routing.Start(v)
         route = []
-        route_load = 0
         route_dist = 0
+        route_load = 0
         prev_index = None
         while not routing.IsEnd(index):
             node = manager.IndexToNode(index)
             route.append(node)
-            route_load += demands[node]
-            # arrival time at node
-            tvar = time_dimension.CumulVar(index)
+            route_load += int(demands[node])
+            # arrival time at this node
+            tvar = time_dim.CumulVar(index)
             arrival = solution.Value(tvar)
             arrival_times[node] = arrival
-            # lateness (if arrival after window end)
+            # lateness relative to node's end time
             tw_end = int(time_windows[node][1])
             if arrival > tw_end:
                 total_lateness += (arrival - tw_end)
@@ -164,10 +167,9 @@ def solve_vrp_ortools(dist_matrix, demands, service_times, time_windows, vehicle
             if not routing.IsEnd(index):
                 curr = manager.IndexToNode(prev_index)
                 nxt = manager.IndexToNode(index)
-                route_dist += dist_matrix[curr][nxt]
+                route_dist += int(dist_matrix[curr][nxt])
         # add depot at end
         route.append(depot)
-        # count served nodes excluding depot
         served_local = sum(1 for nd in route if nd != depot)
         if len(route) > 2:
             routes.append(route)
@@ -183,15 +185,6 @@ def solve_vrp_ortools(dist_matrix, demands, service_times, time_windows, vehicle
         "total_lateness": total_lateness
     }
     return routes, metrics
-
-def apply_variation_matrix(base_matrix, var_pct, rng):
-    if var_pct <= 0:
-        return base_matrix.copy()
-    noise = rng.uniform(1 - var_pct, 1 + var_pct, size=base_matrix.shape)
-    varied = np.round(base_matrix * noise).astype(int)
-    varied[base_matrix == 0] = 0
-    np.fill_diagonal(varied, 0)
-    return varied
 
 def compute_kpis(routes_all, cluster_caps, fuel_cost_per_km, emission_factor, alpha, beta, gamma):
     total_distance = 0
@@ -234,13 +227,13 @@ def compute_kpis(routes_all, cluster_caps, fuel_cost_per_km, emission_factor, al
     return kpis
 
 # ---------------------------
-# Streamlit UI & Flow
+# Streamlit UI
 # ---------------------------
-st.set_page_config(page_title="OptiRoute — Multi-Objective VRP", layout="wide")
-st.title("OptiRoute — Multi-Objective VRP (Cost, Emissions, Time Windows & KPI Dashboard)")
+st.set_page_config(page_title="OptiRoute — VRP (Multi-objective + Time Windows)", layout="wide")
+st.title("OptiRoute — Multi-objective VRP (Cost, Emissions, Time Windows & KPI Dashboard)")
 st.markdown("Team: Vaishali Anand, Vipul Yadav, Kundan, Arpit Agrawal — IIT Delhi, MSL304")
 
-# Sidebar: demo & weights
+# Sidebar: Demo options, weights, cost/emission params, CSV upload
 st.sidebar.header("Demo / Data options")
 demo_customers = st.sidebar.number_input("Demo customers (excluding depot)", min_value=2, max_value=50, value=8, step=1)
 demo_vehicles = st.sidebar.number_input("Demo number of vehicles", min_value=1, max_value=6, value=3, step=1)
@@ -260,7 +253,7 @@ st.sidebar.markdown("---")
 st.sidebar.write("CSV columns allowed: id,x,y,demand,service_time,tw_start,tw_end (id should include depot as 0).")
 uploaded = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
 
-# Create or load base dataframe with time windows & service times
+# Demo data generation or load
 if 'base_df' not in st.session_state or st.session_state.get("last_demo_params", None) != (demo_customers, demo_vehicles, seed):
     rng = np.random.default_rng(seed)
     depot = {"id": 0, "x": 50.0, "y": 50.0, "demand": 0, "service_time": 0, "tw_start": 0, "tw_end": 240}
@@ -271,23 +264,22 @@ if 'base_df' not in st.session_state or st.session_state.get("last_demo_params",
         x = depot['x'] + r * np.cos(angle)
         y = depot['y'] + r * np.sin(angle)
         demand = int(rng.integers(2, 30))
-        # create a time window around some base - ensure feasible in many cases
         tw_center = int(rng.integers(30, 180))
         tw_width = int(rng.integers(20, 80))
         service_time = int(rng.integers(2, 10))
         customers.append({"id": i, "x": float(x), "y": float(y), "demand": int(demand),
                           "service_time": int(service_time),
-                          "tw_start": max(0, tw_center - tw_width//2),
-                          "tw_end": tw_center + tw_width//2})
-    df = pd.DataFrame([depot] + customers)
-    st.session_state['base_df'] = df
+                          "tw_start": max(0, tw_center - tw_width // 2),
+                          "tw_end": tw_center + tw_width // 2})
+    df_demo = pd.DataFrame([depot] + customers)
+    st.session_state['base_df'] = df_demo
     st.session_state['last_demo_params'] = (demo_customers, demo_vehicles, seed)
 
-# If uploaded CSV, use it (validate columns)
+# If CSV uploaded, validate and use
 if uploaded is not None:
     try:
         uploaded_df = pd.read_csv(uploaded)
-        expected_cols = {"id","x","y","demand","service_time","tw_start","tw_end"}
+        expected_cols = {"id", "x", "y", "demand", "service_time", "tw_start", "tw_end"}
         if not expected_cols.issubset(set(uploaded_df.columns)):
             st.sidebar.error(f"CSV must contain columns: {', '.join(sorted(expected_cols))}")
         else:
@@ -299,7 +291,7 @@ if uploaded is not None:
 st.subheader("1) Locations, Demands & Time Windows (editable)")
 df_nodes = st.data_editor(st.session_state['base_df'], num_rows="dynamic", key="nodes_editor")
 
-# Ensure id column exists and depot id 0 exists
+# Validate id/depot
 if 'id' not in df_nodes.columns:
     st.error("Data must include 'id' column. Edit to include id (0 is depot).")
     st.stop()
@@ -308,30 +300,18 @@ if 0 not in df_nodes['id'].values:
     st.warning("No depot with id 0 found. Treating first row as depot and assigning id 0.")
     df_nodes.loc[df_nodes.index[0], 'id'] = 0
 
-# Normalize types and order by id
+# Normalize types & build matrices
 nodes = df_nodes.sort_values('id').reset_index(drop=True)
-coords = nodes[['x','y']].to_numpy()
+coords = nodes[['x', 'y']].to_numpy()
 demands = nodes['demand'].astype(int).to_numpy()
 service_times = nodes['service_time'].astype(int).to_numpy()
 time_windows = list(zip(nodes['tw_start'].astype(int).to_list(), nodes['tw_end'].astype(int).to_list()))
 node_ids = nodes['id'].astype(int).to_list()
-depot_idx = int(np.where(np.array(node_ids)==0)[0][0]) if 0 in node_ids else 0
-
-# Distance matrix (Euclidean rounded)
-def euclid_matrix(coords):
-    n = coords.shape[0]
-    mat = np.zeros((n,n), dtype=int)
-    for i in range(n):
-        for j in range(n):
-            if i==j:
-                mat[i,j]=0
-            else:
-                mat[i,j]=int(round(np.linalg.norm(coords[i]-coords[j])))
-    return mat
+depot_idx = int(np.where(np.array(node_ids) == 0)[0][0]) if 0 in node_ids else 0
 
 base_dist_matrix = euclid_matrix(coords)
 
-# Vehicle parameters
+# Vehicle params
 st.subheader("2) Vehicle Parameters")
 num_vehicles = st.number_input("Number of vehicles", min_value=1, value=demo_vehicles, step=1)
 vehicle_capacity_default = st.number_input("Default vehicle capacity", min_value=1, value=100, step=1)
@@ -345,7 +325,7 @@ for i in range(num_vehicles):
     vehicle_caps.append(int(cap))
     vehicle_maxdist.append(int(md))
 
-# Clustering options & stochastic sliders
+# Clustering & stochastic controls
 st.subheader("3) Stage 1: Customer assignment (Clustering)")
 cluster_method = st.selectbox("Clustering method", options=["KMeans (default)", "Greedy capacity-aware"], index=0)
 do_cluster = st.button("Run clustering and assign customers to vehicles")
@@ -360,7 +340,7 @@ with col_b:
 st.markdown("Click 'Run full pipeline' to perform clustering → routing → KPIs under current stochastic settings.")
 run_pipeline = st.button("Run full pipeline (clustering → routing → KPIs)")
 
-# Keep session state
+# Save into session
 st.session_state['base_df'] = nodes
 st.session_state['coords'] = coords
 st.session_state['demands'] = demands
@@ -368,7 +348,7 @@ st.session_state['service_times'] = service_times
 st.session_state['time_windows'] = time_windows
 st.session_state['dist_matrix'] = base_dist_matrix
 
-# Greedy capacity-aware assign
+# Greedy capacity assign
 def greedy_capacity_assign(coords, demands, num_vehicles, vehicle_caps):
     n = coords.shape[0]
     customers = [i for i in range(n) if i != 0]
@@ -381,7 +361,7 @@ def greedy_capacity_assign(coords, demands, num_vehicles, vehicle_caps):
         remaining[best_v] -= demands[c]
     return assignment
 
-# Run clustering
+# Clustering execution
 if 'cluster_assignment' not in st.session_state:
     st.session_state['cluster_assignment'] = None
 
@@ -403,7 +383,6 @@ if do_cluster or run_pipeline:
                 assignment[i].append(int(idx))
     else:
         assignment = greedy_capacity_assign(coords_local, st.session_state['demands'], num_vehicles, vehicle_caps)
-
     st.session_state['cluster_assignment'] = assignment
 else:
     assignment = st.session_state.get('cluster_assignment', None)
@@ -435,15 +414,15 @@ else:
                                       text=["Depot (0)"], textposition="top center", name="Depot"))
     for v in range(num_vehicles):
         custs = assignment.get(v, [])
-        xs = coords[custs,0] if custs else np.array([])
-        ys = coords[custs,1] if custs else np.array([])
+        xs = coords[custs, 0] if custs else np.array([])
+        ys = coords[custs, 1] if custs else np.array([])
         texts = []
         for i in custs:
             tw = st.session_state['time_windows'][i]
             texts.append(f"id:{int(node_ids[i])}<br>d:{int(st.session_state['demands'][i])}<br>tw:{tw[0]}-{tw[1]}")
-        if len(xs)>0:
+        if len(xs) > 0:
             fig_clusters.add_trace(go.Scatter(x=xs, y=ys, mode='markers+text',
-                                              marker=dict(size=12, color=cmap[v%len(cmap)]),
+                                              marker=dict(size=12, color=cmap[v % len(cmap)]),
                                               text=texts, textposition="bottom center", name=f"Vehicle {v} cluster"))
     fig_clusters.update_layout(title="Customer clusters assigned to vehicles (Stage 1)", height=450)
     st.plotly_chart(fig_clusters, use_container_width=True)
@@ -464,9 +443,8 @@ if run_pipeline:
         varied_demands = np.round(varied_demands * demand_noise).astype(int)
         varied_demands[depot_idx] = 0
 
-    # weighted cost factor for OR-Tools arc cost: combine alpha & beta as a scalar
-    # The actual units: we translate distance -> cost: cost_per_km * alpha + emission_factor * beta (scaled)
-    # To keep solver numeric, compute weighted factor:
+    # combine alpha & beta into a scalar multiplier for solver arc cost
+    # (units: alpha*cost_per_km + beta*emission_factor) -> scalar per km
     weighted_cost_factor = alpha * fuel_cost_per_km + beta * emission_factor
 
     routes_info_all = []
@@ -481,27 +459,27 @@ if run_pipeline:
         local_n = len(local_indices)
         local_mat = np.zeros((local_n, local_n), dtype=int)
         local_dem = []
-        local_service_times = []
-        local_time_windows = []
+        local_serv = []
+        local_tw = []
         for i_local, i_global in enumerate(local_indices):
             local_dem.append(int(varied_demands[i_global]))
-            local_service_times.append(int(st.session_state['service_times'][i_global]))
-            local_time_windows.append((int(st.session_state['time_windows'][i_global][0]), int(st.session_state['time_windows'][i_global][1])))
+            local_serv.append(int(st.session_state['service_times'][i_global]))
+            local_tw.append((int(st.session_state['time_windows'][i_global][0]), int(st.session_state['time_windows'][i_global][1])))
             for j_local, j_global in enumerate(local_indices):
                 local_mat[i_local, j_local] = int(varied_dist[i_global, j_global])
 
         cap = cluster_caps[v] if v < len(cluster_caps) else cluster_caps[-1]
-        routes_local, metrics_local = solve_vrp_ortools(local_mat, local_dem, local_service_times,
-                                                       local_time_windows, cap,
+        routes_local, metrics_local = solve_vrp_ortools(local_mat, local_dem, local_serv,
+                                                       local_tw, cap,
                                                        weighted_cost_factor=weighted_cost_factor,
                                                        penalty=10000, time_limit=6)
-        # Translate local indices back to global indices
+        # translate local -> global indices for display
         translated = []
         for r in routes_local:
             translated.append([local_indices[idx] for idx in r])
         routes_info_all.append({"routes": translated, "metrics": metrics_local})
 
-    # Compute KPIs
+    # KPIs
     kpis = compute_kpis(routes_info_all, cluster_caps, fuel_cost_per_km, emission_factor, alpha, beta, gamma)
 
     # KPI Dashboard
@@ -519,7 +497,7 @@ if run_pipeline:
 
     st.metric("Objective score (α·cost + β·emission + γ·lateness)", f"{kpis['objective_score']:.2f}")
 
-    # Per-vehicle route summary (table)
+    # Per-vehicle route summary
     rows = []
     for vidx, info in enumerate(routes_info_all):
         routes_local = info.get('routes', [])
@@ -535,10 +513,10 @@ if run_pipeline:
     # Route visualization
     st.subheader("Route Visualization")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=coords[:,0], y=coords[:,1], mode='markers+text',
+    fig.add_trace(go.Scatter(x=coords[:, 0], y=coords[:, 1], mode='markers+text',
                              marker=dict(size=10, color='lightgray'),
                              text=[f"id:{int(i)}" for i in node_ids], textposition="bottom center", name="Nodes"))
-    fig.add_trace(go.Scatter(x=[coords[depot_idx,0]], y=[coords[depot_idx,1]], mode='markers+text',
+    fig.add_trace(go.Scatter(x=[coords[depot_idx, 0]], y=[coords[depot_idx, 1]], mode='markers+text',
                              marker=dict(size=18, color='gold', line=dict(width=2)),
                              text=["Depot (0)"], textposition="top center", name="Depot"))
     cmap = [
@@ -548,8 +526,8 @@ if run_pipeline:
     for vidx, info in enumerate(routes_info_all):
         color = cmap[vidx % len(cmap)]
         for r in info.get('routes', []):
-            xs = [coords[int(idx),0] for idx in r]
-            ys = [coords[int(idx),1] for idx in r]
+            xs = [coords[int(idx), 0] for idx in r]
+            ys = [coords[int(idx), 1] for idx in r]
             fig.add_trace(go.Scatter(x=xs, y=ys, mode='lines+markers', line=dict(width=3, color=color),
                                      marker=dict(size=8), name=f"Vehicle {vidx} route"))
     fig.update_layout(title="Routing result after clustering + per-cluster VRP", height=600)
@@ -589,6 +567,20 @@ if run_pipeline:
                     local_serv.append(int(st.session_state['service_times'][i_global]))
                     local_tw.append((int(st.session_state['time_windows'][i_global][0]), int(st.session_state['time_windows'][i_global][1])))
                     for j_local, j_global in enumerate(local_indices):
-                        local_mat[i_local,j_local] = int(dist_s[i_global, j_global])
+                        local_mat[i_local, j_local] = int(dist_s[i_global, j_global])
                 cap = cluster_caps[v] if v < len(cluster_caps) else cluster_caps[-1]
                 _, metrics_tmp = solve_vrp_ortools(local_mat, local_dem, local_serv, local_tw, cap,
+                                                  weighted_cost_factor=weighted_cost_factor, penalty=10000, time_limit=2)
+                routes_info_temp.append({"metrics": metrics_tmp})
+            kpi_tmp = compute_kpis(routes_info_temp, cluster_caps, fuel_cost_per_km, emission_factor, alpha, beta, gamma)
+            sample_totals.append(kpi_tmp['total_distance'])
+        sample_arr = np.array(sample_totals)
+        pct_change = (sample_arr - base_total) / base_total * 100 if base_total > 0 else np.zeros_like(sample_arr)
+        st.line_chart(pd.DataFrame({"Total distance samples": sample_arr, "Pct change vs base": pct_change}))
+        st.write("Sensitivity summary (samples):", f"mean change % = {pct_change.mean():.2f}", f"std % = {pct_change.std():.2f}")
+
+else:
+    st.info("Press 'Run full pipeline' to perform clustering → routing → KPI calculation under current stochastic settings.")
+
+st.markdown("---")
+st.caption("OptiRoute — Multi-objective VRP with Time Windows & KPI Dashboard. Built for MSL304, IIT Delhi.")
