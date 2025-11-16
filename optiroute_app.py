@@ -483,29 +483,22 @@ if run_pipeline:
     kpis = compute_kpis(routes_info_all, cluster_caps, fuel_cost_per_km, emission_factor, alpha, beta, gamma)
 
     # KPI Dashboard
-    st.subheader("📊 KPI Dashboard — After Routing")
+    # --- KPI Dashboard ---
+st.subheader("KPI Dashboard (after routing)")
 
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Total Distance (km)", f"{kpis['total_distance']}")
-k2.metric("Total Delivered Load", f"{kpis['total_load']}")
-k3.metric("Vehicles Used", f"{kpis['vehicles_used']}/{num_vehicles}")
-k4.metric("Avg Utilization (%)", f"{kpis['avg_utilization_pct']:.1f}%")
-k5.metric("Total Lateness (mins)", f"{kpis['total_lateness']}")
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Total Distance", f"{kpis['total_distance']}")
+c2.metric("Total Load", f"{kpis['total_load']}")
+c3.metric("Vehicles Used", f"{kpis['vehicles_used']}/{num_vehicles}")
+c4.metric("Avg Util (%)", f"{kpis['avg_utilization_pct']:.1f}%")
+c5.metric("Total Lateness", f"{kpis['total_lateness']}")
 
-k6, k7, k8 = st.columns(3)
-k6.metric("Total Fuel Cost", f"{kpis['total_cost']:.2f}")
-k7.metric("Total Emissions", f"{kpis['total_emission']:.2f}")
-k8.metric("Objective Score", f"{kpis['objective_score']:.2f}")
+c6, c7 = st.columns(2)
+c6.metric("Total Cost", f"{kpis['total_cost']:.2f}")
+c7.metric("Total Emission", f"{kpis['total_emission']:.2f}")
 
-st.write("### 🔍 Objective Function")
-st.write(f"""
-**Z = α·Cost + β·Emission + γ·Lateness**  
-Where:  
-- α = {alpha}  
-- β = {beta}  
-- γ = {gamma}  
----
-""")
+st.metric("Objective Score (α·cost + β·emission + γ·lateness)", f"{kpis['objective_score']:.2f}")
+
 
     # Per-vehicle route summary
     rows = []
